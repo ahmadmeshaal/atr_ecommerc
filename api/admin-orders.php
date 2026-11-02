@@ -76,16 +76,18 @@ try {
 
             $search = $_GET['search'] ?? '';
             $status = $_GET['status'] ?? '';
+            $paymentMethod = $_GET['payment_method'] ?? '';
 
-            if (!is_string($search) || !is_string($status)) {
+            if (!is_string($search) || !is_string($status) || !is_string($paymentMethod)) {
                 Response::json(422, [
                     'success' => false,
-                    'message' => 'Search and status must be strings'
+                    'message' => 'Search and filters must be strings'
                 ]);
             }
 
             $search = trim($search);
             $status = trim($status);
+            $paymentMethod = trim($paymentMethod);
 
             $allowedStatuses = [
                 'pending',
@@ -103,6 +105,13 @@ try {
                 Response::json(422, [
                     'success' => false,
                     'message' => 'Invalid order status'
+                ]);
+            }
+
+            if ($paymentMethod !== '' && !in_array($paymentMethod, ['cash', 'visa'], true)) {
+                Response::json(422, [
+                    'success' => false,
+                    'message' => 'Invalid payment method'
                 ]);
             }
 
@@ -149,10 +158,12 @@ try {
 
                 $query .= " AND (
                     u.name LIKE :search
+                    OR u.email LIKE :search_email
                     OR o.id = :order_id
                 )";
 
                 $params['search'] = '%' . $search . '%';
+                $params['search_email'] = '%' . $search . '%';
                 $params['order_id'] = $searchOrderId !== false
                     ? $searchOrderId
                     : 0;
@@ -161,6 +172,11 @@ try {
             if ($status !== '') {
                 $query .= ' AND o.status = :status';
                 $params['status'] = $status;
+            }
+
+            if ($paymentMethod !== '') {
+                $query .= ' AND p.payment_method = :payment_method';
+                $params['payment_method'] = $paymentMethod;
             }
 
             $countStmt = $pdo->prepare('SELECT COUNT(*) ' . $query);
@@ -221,6 +237,27 @@ try {
                 ]);
             }
 
+            if (($body['action'] ?? '') === 'edit_delivered_status') {
+                $newStatus = $body['status'] ?? '';
+                if (!is_string($newStatus) || !in_array(trim($newStatus), ['confirmed', 'processing', 'shipped', 'delivered'], true)) {
+                    Response::json(422, ['success' => false, 'message' => 'Invalid status for a delivered order']);
+                }
+                $order = $orderModel->getOrderDetails($id);
+                if (!$order) {
+                    Response::json(404, ['success' => false, 'message' => 'Order not found']);
+                }
+                if ($order['status'] !== 'delivered') {
+                    Response::json(409, ['success' => false, 'message' => 'Only delivered orders can be edited here']);
+                }
+                try {
+                    $orderModel->updateDeliveredOrderStatus((int) $id, trim($newStatus));
+                } catch (InvalidArgumentException $e) {
+                    Response::json(422, ['success' => false, 'message' => $e->getMessage()]);
+                } catch (RuntimeException $e) {
+                    Response::json(409, ['success' => false, 'message' => $e->getMessage()]);
+                }
+                Response::json(200, ['success' => true, 'message' => 'Order status updated', 'data' => ['status' => trim($newStatus)]]);
+            }
             $newStatus = $body['status'] ?? '';
 
             if (!is_string($newStatus)) {
@@ -232,12 +269,37 @@ try {
 
             $newStatus = trim($newStatus);
 
-            // Matches the current Order::updateOrderStatus() implementation.
-            if (!in_array($newStatus, ['delivered', 'cancelled'], true)) {
+            if (!in_array($newStatus, ['confirmed', 'processing', 'shipped', 'delivered', 'cancelled'], true)) {
                 Response::json(422, [
                     'success' => false,
-                    'message' => 'Status must be delivered or cancelled'
+                    'message' => 'Invalid order status'
                 ]);
+            }
+
+            $cancellationReason = null;
+            if ($newStatus === 'cancelled') {
+                $reasonKey = $body['cancellation_reason'] ?? '';
+                $reasonLabels = [
+                    'out_of_stock' => 'An item is out of stock.',
+                    'delivery_issue' => 'We are unable to complete delivery at this time.',
+                    'payment_issue' => 'The payment could not be confirmed.',
+                    'address_unavailable' => 'The delivery address could not be serviced.',
+                    'customer_request' => 'The cancellation was requested by the customer.',
+                ];
+                if (!is_string($reasonKey)) {
+                    Response::json(422, ['success' => false, 'message' => 'Please choose a cancellation reason']);
+                }
+                if ($reasonKey === 'other') {
+                    $customReason = $body['custom_cancellation_reason'] ?? '';
+                    if (!is_string($customReason) || trim($customReason) === '' || mb_strlen(trim($customReason), 'UTF-8') > 500) {
+                        Response::json(422, ['success' => false, 'message' => 'Enter a cancellation reason (up to 500 characters)']);
+                    }
+                    $cancellationReason = trim($customReason);
+                } elseif (isset($reasonLabels[$reasonKey])) {
+                    $cancellationReason = $reasonLabels[$reasonKey];
+                } else {
+                    Response::json(422, ['success' => false, 'message' => 'Please choose a cancellation reason']);
+                }
             }
 
             $order = $orderModel->getOrderDetails($id);
@@ -250,7 +312,7 @@ try {
             }
 
             try {
-                $updated = $orderModel->updateOrderStatus($id, $newStatus);
+                $updated = $orderModel->updateOrderStatus($id, $newStatus, $cancellationReason);
             } catch (PDOException $e) {
                 throw $e;
             } catch (Exception $e) {

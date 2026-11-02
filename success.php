@@ -2,6 +2,7 @@
 
 require_once __DIR__ . '/includes/session.php';
 require_once __DIR__ . '/config/Database.php';
+require_once __DIR__ . '/classes/Order.php';
 require_once __DIR__ . '/vendor/autoload.php';
 
 if (!isset($_SESSION['user_id'])) {
@@ -23,7 +24,11 @@ if (
 $sendConfirmation = false;
 
 try {
-    $stripeConfig = require __DIR__ . '/config/stripe.php';
+    $stripeConfigPath = __DIR__ . '/config/stripe.php';
+    if (!is_file($stripeConfigPath)) {
+        $stripeConfigPath = __DIR__ . '/config/strip.php';
+    }
+    $stripeConfig = require $stripeConfigPath;
 
     \Stripe\Stripe::setApiKey($stripeConfig['secret_key']);
 
@@ -63,7 +68,8 @@ try {
     $pdo->beginTransaction();
 
     $stmt = $pdo->prepare(
-        "SELECT id, total_amount, status
+        "SELECT id, total_amount, status,
+                UNIX_TIMESTAMP(DATE_ADD(created_at, INTERVAL 6 HOUR)) AS cancel_until
          FROM orders
          WHERE id = ? AND user_id = ?
          FOR UPDATE"
@@ -144,32 +150,20 @@ try {
         );
         $stmt->execute([$session->id, $payment['id']]);
 
+        $confirmOrder = $pdo->prepare(
+            "UPDATE orders SET status = 'confirmed' WHERE id = ? AND status = 'pending'"
+        );
+        $confirmOrder->execute([$orderId]);
         $sendConfirmation = true;
     }
 
     $pdo->commit();
     if ($sendConfirmation) {
     try {
-        $stmt = $pdo->prepare(
-            "SELECT email FROM users WHERE id = ?"
-        );
-        $stmt->execute([$userId]);
-
-        $email = $stmt->fetchColumn();
-
-        if (!is_string($email) || $email === '') {
-            throw new RuntimeException('Customer email not found.');
-        }
-
         require_once __DIR__ . '/classes/MailService.php';
-
         $mailService = new MailService();
-
-        $sent = $mailService->sendOrderConfirmation(
-            $email,
-            $orderId,
-            number_format($orderTotalCents / 100, 2, '.', '')
-        );
+        $details = (new Order($pdo))->getOrderEmailDetails((int) $orderId);
+        $sent = $details ? $mailService->sendOrderPaid($details) : false;
 
         if (!$sent) {
             error_log(
@@ -198,41 +192,4 @@ try {
     );
 }
 ?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Payment Successful</title>
-    <link
-        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
-        rel="stylesheet"
-    >
-</head>
-<body class="bg-light">
-    <main class="container mt-5 text-center">
-        <div
-            class="card shadow-sm border-0 p-5 mx-auto"
-            style="max-width: 500px;"
-        >
-            <h1 class="text-success mb-3">Payment Successful!</h1>
-
-            <p class="lead">
-                Thank you for your purchase.
-                Your order
-                <strong>#<?= (int) $orderId ?></strong>
-                has been placed successfully.
-            </p>
-
-            <div class="mt-4">
-                <a href="my-orders.php" class="btn btn-primary">
-                    View My Orders
-                </a>
-                <a href="index.php" class="btn btn-outline-secondary">
-                    Return to Store
-                </a>
-            </div>
-        </div>
-    </main>
-</body>
-</html>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment received — Ater</title><link rel="stylesheet" href="assets/css/style.css"><link rel="stylesheet" href="assets/css/storefront.css?v=20261102-responsive"><script defer src="assets/js/storefront.js?v=20261102-autosignup"></script></head><body><?php $storeActive=''; include __DIR__.'/includes/store-header.php'; ?><main class="page-shell"><section class="success-panel"><div class="success-mark">✳</div><p class="eyebrow">A LOVELY CHOICE</p><h1>Payment received.</h1><p>Thank you for your order <strong>#<?= (int) $orderId ?></strong>. We’re preparing your fragrance with care.</p><a class="button button-dark" href="account.php">VIEW MY ORDERS</a><p><a class="text-link" href="index.php">Back to the store ↗</a></p></section></main><?php include __DIR__.'/includes/store-footer.php'; ?></body></html>

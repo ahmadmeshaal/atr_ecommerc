@@ -4,6 +4,8 @@ require_once __DIR__ . '/../includes/session.php';
 require_once __DIR__ . '/../config/Database.php';
 require_once __DIR__ . '/../core/Response.php';
 require_once __DIR__ . '/../classes/Review.php';
+require_once __DIR__ . '/../classes/AiClientFactory.php';
+require_once __DIR__ . '/../classes/ReviewModeration.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 
@@ -119,6 +121,32 @@ try {
 
 try {
     $review = new Review($database);
+    $moderateReview = static function (int $reviewId, int $rating, ?string $comment) use ($review): array {
+        $moderator = new ReviewModeration();
+        try {
+            $moderator = new ReviewModeration(AiClientFactory::create());
+        } catch (Throwable $configurationError) {
+            error_log('AI review moderation provider unavailable; local safety screening remains active: ' . $configurationError->getMessage());
+        }
+        try {
+            $decision = $moderator->inspect($rating, $comment);
+            $status = $decision['status'];
+            $reason = $decision['reason'];
+            if ($status === 'flagged' && $reason !== null) {
+                $reason = ($decision['source'] ?? '') === 'ai' ? 'AI moderation: ' . $reason : 'Automatic safety screening: ' . $reason;
+            } elseif ($status === 'approved') {
+                $reason = ($decision['source'] ?? '') === 'ai'
+                    ? 'AI moderation: approved'
+                    : 'Automatic approval: no written comment to check.';
+            }
+            $review->setModeration($reviewId, $status, $reason);
+            return ['status' => $status, 'source' => $decision['source'] ?? 'ai'];
+        } catch (Throwable $moderationError) {
+            error_log('AI review moderation failed; review held for admin review: ' . $moderationError->getMessage());
+            $review->setModeration($reviewId, 'pending', 'AI moderation could not complete. This review is hidden until an admin checks it.');
+            return ['status' => 'pending', 'source' => 'unavailable'];
+        }
+    };
 
     switch ($method) {
         case 'GET':
@@ -172,19 +200,24 @@ try {
                 ]);
             }
 
-            $review->create([
+            $reviewId = $review->create([
                 'user_id' => $userId,
                 'product_id' => $productId,
                 'order_id' => $orderId,
                 'rating' => $data['rating'],
                 'comment' => $data['comment']
             ]);
-
+            $moderation = $moderateReview($reviewId, $data['rating'], $data['comment']);
             Response::json(201, [
                 'success' => true,
-                'message' => 'Review submitted successfully'
+                'message' => $moderation['status'] === 'flagged'
+                    ? 'Our automatic review check flagged this review. It is hidden until the store team checks it.'
+                    : ($moderation['status'] === 'pending'
+                        ? 'Your review is saved and hidden while the automatic check is unavailable. The store team will review it.'
+                        : 'Review submitted successfully'),
+                'moderation_status' => $moderation['status'],
+                'moderation_source' => $moderation['source']
             ]);
-
         case 'PUT':
             $id = $readInteger(
                 $_GET['id'] ?? null,
@@ -232,21 +265,20 @@ try {
                 ]);
             }
 
-            // An unchanged rating/comment is a valid update.
-            $review->update(
-                $id,
-                $userId,
-                $data['rating'],
-                $data['comment']
-            );
-
+            $review->update($id, $userId, $data['rating'], $data['comment']);
             $pdo->commit();
 
+            $moderation = $moderateReview($id, $data['rating'], $data['comment']);
             Response::json(200, [
                 'success' => true,
-                'message' => 'Review updated successfully'
-            ]);
-    }
+                'message' => $moderation['status'] === 'flagged'
+                    ? 'Our automatic review check flagged this review. It is hidden until the store team checks it.'
+                    : ($moderation['status'] === 'pending'
+                        ? 'Your review is saved and hidden while the automatic check is unavailable. The store team will review it.'
+                        : 'Review updated successfully'),
+                'moderation_status' => $moderation['status'],
+                'moderation_source' => $moderation['source']
+            ]);    }
 } catch (PDOException $e) {
     if ($pdo->inTransaction()) {
         $pdo->rollBack();

@@ -1,6 +1,8 @@
 <?php
 
 require_once __DIR__ . '/../includes/init.php';
+require_once __DIR__ . '/../classes/GuestCart.php';
+require_once __DIR__ . '/../classes/GuestWishlist.php';
 
 $googleAuth = new GoogleAuth();
 
@@ -104,6 +106,29 @@ session_regenerate_id(true);
 $_SESSION['user_id'] = (int) $user['id'];
 $_SESSION['user_role'] = $user['role'];
 
-// Redirect to homepage
-header('Location: /perfume_ecommerce/index.php');
+try {
+    GuestCart::mergeInto($conn, (int) $user['id']);
+} catch (Throwable $e) {
+    error_log('Guest cart merge after Google sign-in failed: ' . $e->getMessage());
+}
+try {
+    GuestWishlist::mergeInto($conn, (int) $user['id']);
+} catch (Throwable $e) {
+    error_log('Guest wishlist merge after Google sign-in failed: ' . $e->getMessage());
+}
+
+
+$returnPath = $_SESSION['google_return'] ?? 'account.php';
+unset($_SESSION['google_return']);
+$allowedReturns = ['cart.php', 'checkout.php', 'wishlist.php', 'account.php', 'index.php'];
+if (!in_array($returnPath, $allowedReturns, true) && !preg_match('/^product\.php\?id=\d+$/', (string) $returnPath)) {
+    $returnPath = 'account.php';
+}
+$scriptPath = str_replace('\\', '/', (string) ($_SERVER['SCRIPT_NAME'] ?? '/actions/google-callback.php'));
+$projectPath = rtrim(dirname(dirname($scriptPath)), '/');
+$projectPath = implode('/', array_map(
+    static fn(string $segment): string => rawurlencode(rawurldecode($segment)),
+    explode('/', $projectPath)
+));
+header('Location: ' . $projectPath . '/' . $returnPath);
 exit;

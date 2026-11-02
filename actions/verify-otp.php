@@ -1,6 +1,8 @@
 <?php
 
 require_once __DIR__ . '/../includes/init.php';
+require_once __DIR__ . '/../classes/GuestCart.php';
+require_once __DIR__ . '/../classes/GuestWishlist.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     Response::json(405, [
@@ -62,7 +64,21 @@ if (!$isVerified) {
     ]);
 }
 
+session_regenerate_id(true);
+$_SESSION['user_id'] = (int) $user['id'];
+$_SESSION['user_role'] = $user['role'];
+
+try {
+    GuestCart::mergeInto($conn, (int) $user['id']);
+} catch (Throwable $e) {
+    error_log('Guest cart merge after email verification failed: ' . $e->getMessage());
+}
+try {
+    GuestWishlist::mergeInto($conn, (int) $user['id']);
+} catch (Throwable $e) {
+    error_log('Guest wishlist merge after email verification failed: ' . $e->getMessage());
+}
 Response::json(200, [
     'success' => true,
-    'message' => 'Email verified successfully'
+    'message' => 'Email verified. You are now signed in.'
 ]);

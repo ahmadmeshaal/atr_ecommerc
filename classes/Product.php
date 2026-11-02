@@ -307,6 +307,34 @@ class Product
         }
     }
 
+    public function setActiveStatus(int $id, bool $isActive): bool
+    {
+        $this->pdo->beginTransaction();
+        try {
+            $lock = $this->pdo->prepare('SELECT id FROM products WHERE id = ? FOR UPDATE');
+            $lock->execute([$id]);
+            if ($lock->fetchColumn() === false) {
+                $this->pdo->commit();
+                return false;
+            }
+            $update = $this->pdo->prepare('UPDATE products SET is_active = ? WHERE id = ?');
+            $update->execute([$isActive ? 1 : 0, $id]);
+            if (!$isActive) {
+                $removeFromCart = $this->pdo->prepare(
+                    'DELETE ci FROM cart_items ci JOIN product_variants v ON v.id = ci.variant_id WHERE v.product_id = ?'
+                );
+                $removeFromCart->execute([$id]);
+            }
+            $this->pdo->commit();
+            return true;
+        } catch (Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
+    }
+
     private function deleteLocalProductImage(string $imagePath): void
     {
         if (filter_var($imagePath, FILTER_VALIDATE_URL)) {

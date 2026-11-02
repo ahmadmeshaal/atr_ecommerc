@@ -7,3 +7,6 @@
 /vendor/
 /config/mail.php
 /config/stripe.php
+/config/strip.php
+
+/config/ai.php

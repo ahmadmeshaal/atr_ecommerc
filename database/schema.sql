@@ -293,6 +293,9 @@ CREATE TABLE `reviews` (
   `rating` tinyint(3) UNSIGNED NOT NULL,
   `comment` text DEFAULT NULL,
   `is_active` tinyint(1) DEFAULT 1,
+  `moderation_status` enum('pending','approved','flagged','rejected') NOT NULL DEFAULT 'approved',
+  `moderation_reason` varchar(255) DEFAULT NULL,
+  `moderated_at` datetime DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ;

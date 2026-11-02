@@ -21,8 +21,8 @@ if (($_SESSION['user_role'] ?? '') !== 'admin') {
 
 $method = $_SERVER['REQUEST_METHOD'];
 
-if (!in_array($method, ['GET', 'DELETE'], true)) {
-    header('Allow: GET, DELETE');
+if (!in_array($method, ['GET', 'DELETE', 'PUT'], true)) {
+    header('Allow: GET, DELETE, PUT');
 
     Response::json(405, [
         'success' => false,
@@ -77,6 +77,26 @@ try {
                 'data' => $data
             ]);
 
+        case 'PUT':
+            $id = filter_var($_GET['id'] ?? null, FILTER_VALIDATE_INT);
+            if ($id === false || $id === null || $id <= 0) {
+                Response::json(400, ['success' => false, 'message' => 'A positive review ID is required']);
+            }
+            try {
+                $body = json_decode(file_get_contents('php://input'), true, 16, JSON_THROW_ON_ERROR);
+            } catch (Throwable $e) {
+                Response::json(400, ['success' => false, 'message' => 'Invalid JSON body']);
+            }
+            $action = $body['action'] ?? '';
+            if ($action === 'approve') {
+                $review->setModeration((int)$id, 'approved');
+                Response::json(200, ['success' => true, 'message' => 'Review approved and published.']);
+            }
+            if ($action === 'keep_hidden') {
+                $review->setModeration((int)$id, 'rejected', 'Kept hidden by admin');
+                Response::json(200, ['success' => true, 'message' => 'Review will remain hidden.']);
+            }
+            Response::json(422, ['success' => false, 'message' => 'Action must be approve or keep_hidden']);
         case 'DELETE':
             $id = isset($_GET['id'])
                 ? filter_var($_GET['id'], FILTER_VALIDATE_INT)

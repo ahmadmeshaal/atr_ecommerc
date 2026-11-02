@@ -14,7 +14,9 @@ class Order
         $addressData,
         $financialData,
         $cartItems,
-        $paymentMethod = 'cash'
+        $paymentMethod = 'cash',
+        $couponId = null,
+        $buyNow = false
     ) {
         if (!in_array($paymentMethod, ['cash', 'visa'], true)) {
             throw new InvalidArgumentException('Invalid payment method.');
@@ -27,15 +29,23 @@ class Order
         $this->pdo->beginTransaction();
 
         try {
-            $stmt = $this->pdo->prepare(
-                "SELECT id, variant_id, quantity
-                 FROM cart_items
-                 WHERE user_id = ?
-                 ORDER BY variant_id
-                 FOR UPDATE"
-            );
-            $stmt->execute([$userId]);
-            $currentCart = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            if ($buyNow) {
+                $currentCart = array_map(static fn($item) => [
+                    'id' => null,
+                    'variant_id' => (int) $item['variant_id'],
+                    'quantity' => (int) $item['quantity']
+                ], $cartItems);
+            } else {
+                $stmt = $this->pdo->prepare(
+                    "SELECT id, variant_id, quantity
+                     FROM cart_items
+                     WHERE user_id = ?
+                     ORDER BY variant_id
+                     FOR UPDATE"
+                );
+                $stmt->execute([$userId]);
+                $currentCart = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            }
 
             if (count($currentCart) !== count($cartItems)) {
                 throw new RuntimeException(
@@ -153,6 +163,21 @@ class Order
                 );
             }
 
+            if ($couponId !== null) {
+                require_once __DIR__ . '/CouponService.php';
+                $coupon = (new CouponService($this->pdo))->validateId(
+                    (int) $couponId,
+                    $subtotalCents,
+                    true,
+                    (int) $userId
+                );
+                if ((int) round((float) $financialData['discount_amount'] * 100) !== $coupon['discount_cents']) {
+                    throw new RuntimeException('Coupon discount changed. Please refresh checkout.');
+                }
+            } elseif ((int) round((float) $financialData['discount_amount'] * 100) !== 0) {
+                throw new InvalidArgumentException('A valid coupon is required for this discount.');
+            }
+
             $deliveryCents = (int) round(
                 (float) $financialData['delivery_fee'] * 100
             );
@@ -182,11 +207,11 @@ class Order
             $stmt = $this->pdo->prepare(
                 "INSERT INTO orders (
                     user_id, city, area, street, building,
-                    subtotal, discount_amount, delivery_fee,
+                    subtotal, discount_amount, delivery_fee, coupon_id,
                     total_amount, status
                  ) VALUES (
                     :user_id, :city, :area, :street, :building,
-                    :subtotal, :discount_amount, :delivery_fee,
+                    :subtotal, :discount_amount, :delivery_fee, :coupon_id,
                     :total_amount, 'pending'
                  )"
             );
@@ -199,6 +224,7 @@ class Order
                 'subtotal' => $subtotalCents / 100,
                 'discount_amount' => $discountCents / 100,
                 'delivery_fee' => $deliveryCents / 100,
+                'coupon_id' => $couponId,
                 'total_amount' => $totalCents / 100
             ]);
 
@@ -245,10 +271,12 @@ class Order
                     $item['price']
                 ]);
 
-                $stmt = $this->pdo->prepare(
-                    "DELETE FROM cart_items WHERE id = ? AND user_id = ?"
-                );
-                $stmt->execute([$item['cart_id'], $userId]);
+                if (!$buyNow) {
+                    $stmt = $this->pdo->prepare(
+                        "DELETE FROM cart_items WHERE id = ? AND user_id = ?"
+                    );
+                    $stmt->execute([$item['cart_id'], $userId]);
+                }
             }
 
             $this->pdo->commit();
@@ -268,7 +296,8 @@ class Order
         $this->autoConfirmOrders();
 
         $stmt = $this->pdo->prepare(
-            "SELECT id, total_amount, status, created_at
+            "SELECT id, total_amount, status, created_at,
+                    UNIX_TIMESTAMP(DATE_ADD(created_at, INTERVAL 6 HOUR)) AS cancel_until
              FROM orders
              WHERE user_id = ?
              ORDER BY created_at DESC, id DESC"
@@ -285,7 +314,8 @@ class Order
         $stmt = $this->pdo->prepare(
             "SELECT id, city, area, street, building, subtotal,
                     discount_amount, delivery_fee, total_amount,
-                    status, created_at
+                    status, created_at,
+                    UNIX_TIMESTAMP(DATE_ADD(created_at, INTERVAL 6 HOUR)) AS cancel_until
              FROM orders
              WHERE id = ? AND user_id = ?"
         );
@@ -298,13 +328,27 @@ class Order
 
         $stmt = $this->pdo->prepare(
             "SELECT oi.quantity, oi.unit_price AS price,
-                    p.name AS product_name, v.size_ml
+                    v.product_id,
+                    p.name AS product_name, v.size_ml,
+                    (SELECT pi.image_path FROM product_images pi
+                     WHERE pi.product_id = p.id
+                     ORDER BY pi.is_primary DESC, pi.sort_order ASC, pi.id ASC
+                     LIMIT 1) AS image_path,
+                    r.id AS review_id, r.rating AS review_rating,
+                    r.comment AS review_comment,
+                    r.moderation_status AS review_status
              FROM order_items oi
              JOIN product_variants v ON oi.variant_id = v.id
              JOIN products p ON v.product_id = p.id
+             LEFT JOIN reviews r ON r.id = (
+                 SELECT MAX(r2.id) FROM reviews r2
+                 WHERE r2.order_id = oi.order_id
+                   AND r2.product_id = p.id
+                   AND r2.user_id = ?
+             )
              WHERE oi.order_id = ?"
         );
-        $stmt->execute([$orderId]);
+        $stmt->execute([$userId, $orderId]);
         $order['items'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
         return $order;
@@ -354,7 +398,68 @@ class Order
         return $order;
     }
 
-    public function cancelOrder($orderId, $isAdmin = false)
+    public function getOrderEmailDetails(int $orderId): ?array
+    {
+        $stmt = $this->pdo->prepare(
+            "SELECT o.*, u.name AS customer_name, u.email,
+                    p.payment_method, p.status AS payment_status
+             FROM orders o
+             JOIN users u ON u.id = o.user_id
+             LEFT JOIN payments p ON p.order_id = o.id
+             WHERE o.id = ?
+             LIMIT 1"
+        );
+        $stmt->execute([$orderId]);
+        $order = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$order) {
+            return null;
+        }
+
+        $stmt = $this->pdo->prepare(
+            "SELECT oi.quantity, oi.unit_price, p.name AS product_name,
+                    v.size_ml,
+                    (SELECT pi.image_path FROM product_images pi
+                     WHERE pi.product_id = p.id
+                     ORDER BY pi.is_primary DESC, pi.sort_order ASC, pi.id ASC
+                     LIMIT 1) AS image_path
+             FROM order_items oi
+             JOIN product_variants v ON v.id = oi.variant_id
+             JOIN products p ON p.id = v.product_id
+             WHERE oi.order_id = ?
+             ORDER BY oi.id"
+        );
+        $stmt->execute([$orderId]);
+        $order['items'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return $order;
+    }
+
+    public function notifyOrderEmail(int $orderId, string $event, ?string $reason = null): void
+    {
+        try {
+            $autoload = __DIR__ . '/../vendor/autoload.php';
+            if (is_file($autoload)) {
+                require_once $autoload;
+            }
+            require_once __DIR__ . '/MailService.php';
+            $details = $this->getOrderEmailDetails($orderId);
+            if (!$details) {
+                error_log('Order email skipped: order ' . $orderId . ' not found.');
+                return;
+            }
+            $service = new MailService();
+            $sent = match ($event) {
+                'placed' => $service->sendOrderPlaced($details),
+                default => $service->sendOrderStatus($details, $event, $reason),
+            };
+            if (!$sent) {
+                error_log('Order email was not sent for order ' . $orderId . ' (' . $event . ').');
+            }
+        } catch (Throwable $e) {
+            error_log('Order email failed for order ' . $orderId . ': ' . $e->getMessage());
+        }
+    }
+
+    public function cancelOrder($orderId, $isAdmin = false, ?string $cancellationReason = null, bool $notifyCustomer = true)
     {
         $this->pdo->beginTransaction();
 
@@ -440,68 +545,54 @@ class Order
             throw $e;
         }
 
-        if ($isAdmin) {
-            $this->sendCancellationEmail(
-                (int) $order['user_id'],
-                (int) $orderId
+        if ($notifyCustomer) {
+            $this->notifyOrderEmail(
+                (int) $orderId,
+                'cancelled',
+                $isAdmin ? $cancellationReason : 'Cancelled at your request.'
             );
         }
 
         return true;
     }
 
-    private function sendCancellationEmail(int $userId, int $orderId): void
+    public function updateDeliveredOrderStatus(int $orderId, string $newStatus): bool
     {
-        try {
-            $stmt = $this->pdo->prepare(
-                "SELECT email FROM users WHERE id = ?"
-            );
-            $stmt->execute([$userId]);
-            $email = $stmt->fetchColumn();
+        if (!in_array($newStatus, ['confirmed', 'processing', 'shipped', 'delivered'], true)) {
+            throw new InvalidArgumentException('Invalid status for a delivered order.');
+        }
 
-            if (!$email) {
-                return;
+        $this->pdo->beginTransaction();
+        try {
+            $stmt = $this->pdo->prepare('SELECT status FROM orders WHERE id = ? FOR UPDATE');
+            $stmt->execute([$orderId]);
+            $order = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$order || $order['status'] !== 'delivered') {
+                throw new RuntimeException('Only delivered orders can be edited here.');
             }
 
-            require_once __DIR__ . '/../vendor/autoload.php';
-            $config = require __DIR__ . '/../config/mail.php';
-
-            $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
-            $mail->Timeout = 10;
-            $mail->isSMTP();
-            $mail->Host = $config['host'];
-            $mail->SMTPAuth = true;
-            $mail->Username = $config['username'];
-            $mail->Password = $config['password'];
-            $mail->SMTPSecure =
-                \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS;
-            $mail->Port = $config['port'];
-
-            $mail->setFrom($config['username'], 'Perfume Store');
-            $mail->addAddress($email);
-            $mail->isHTML(true);
-            $mail->Subject = 'Order Cancelled - Perfume Store';
-            $mail->Body =
-                "<p>Your order #{$orderId} has been cancelled "
-                . "by the administration.</p>";
-            $mail->AltBody =
-                "Your order #{$orderId} has been cancelled "
-                . "by the administration.";
-
-            $mail->send();
+            $stmt = $this->pdo->prepare('UPDATE orders SET status = ? WHERE id = ?');
+            $stmt->execute([$newStatus, $orderId]);
+            $this->pdo->commit();
+            if ($order['status'] !== $newStatus) {
+                $this->notifyOrderEmail($orderId, $newStatus);
+            }
+            return true;
         } catch (Throwable $e) {
-            error_log('Cancellation email failed: ' . $e->getMessage());
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
         }
     }
-
-    public function updateOrderStatus($orderId, $status)
+    public function updateOrderStatus($orderId, $status, ?string $cancellationReason = null)
     {
-        if (!in_array($status, ['delivered', 'cancelled'], true)) {
+        if (!in_array($status, ['confirmed', 'processing', 'shipped', 'delivered', 'cancelled'], true)) {
             return false;
         }
 
         if ($status === 'cancelled') {
-            return $this->cancelOrder($orderId, true);
+            return $this->cancelOrder($orderId, true, $cancellationReason);
         }
 
         $this->pdo->beginTransaction();
@@ -522,6 +613,11 @@ class Order
                 throw new RuntimeException(
                     'Cannot deliver a cancelled order.'
                 );
+            }
+
+            if ($order['status'] === $status) {
+                $this->pdo->commit();
+                return true;
             }
 
             $stmt = $this->pdo->prepare(
@@ -560,10 +656,8 @@ class Order
                 }
             }
 
-            $stmt = $this->pdo->prepare(
-                "UPDATE orders SET status = 'delivered' WHERE id = ?"
-            );
-            $stmt->execute([$orderId]);
+            $stmt = $this->pdo->prepare("UPDATE orders SET status = ? WHERE id = ?");
+            $stmt->execute([$status, $orderId]);
 
             $stmt = $this->pdo->prepare(
                 "UPDATE payments
@@ -572,9 +666,13 @@ class Order
                    AND payment_method = 'cash'
                    AND status = 'pending'"
             );
-            $stmt->execute([$orderId]);
+            if ($status === 'delivered') {
+                $stmt->execute([$orderId]);
+            }
 
             $this->pdo->commit();
+
+            $this->notifyOrderEmail($orderId, $status);
 
             return true;
         } catch (Throwable $e) {
@@ -588,23 +686,38 @@ class Order
 
     public function autoConfirmOrders()
     {
-        $stmt = $this->pdo->prepare(
-            "UPDATE orders o
-             SET o.status = 'confirmed'
-             WHERE o.status = 'pending'
-               AND o.created_at < DATE_SUB(NOW(), INTERVAL 6 HOUR)
-               AND EXISTS (
-                   SELECT 1 FROM payments p
-                   WHERE p.order_id = o.id
-                     AND (
-                         p.payment_method = 'cash'
-                         OR (
-                             p.payment_method = 'visa'
-                             AND p.status = 'completed'
-                         )
-                     )
-               )"
-        );
-        $stmt->execute();
+        $this->pdo->beginTransaction();
+        try {
+            $stmt = $this->pdo->query(
+                "SELECT o.id
+                 FROM orders o
+                 WHERE o.status = 'pending'
+                   AND o.created_at < DATE_SUB(NOW(), INTERVAL 6 HOUR)
+                   AND EXISTS (
+                       SELECT 1 FROM payments p
+                       WHERE p.order_id = o.id
+                         AND (p.payment_method = 'cash'
+                              OR (p.payment_method = 'visa' AND p.status = 'completed'))
+                   )
+                 FOR UPDATE"
+            );
+            $orderIds = array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN));
+            if ($orderIds) {
+                $marks = implode(',', array_fill(0, count($orderIds), '?'));
+                $update = $this->pdo->prepare(
+                    "UPDATE orders SET status = 'confirmed' WHERE status = 'pending' AND id IN ({$marks})"
+                );
+                $update->execute($orderIds);
+            }
+            $this->pdo->commit();
+            foreach ($orderIds as $orderId) {
+                $this->notifyOrderEmail($orderId, 'confirmed');
+            }
+        } catch (Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            throw $e;
+        }
     }
 }
