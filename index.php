@@ -12,7 +12,7 @@ $storeActive = 'home';
     <title>Ater — Fragrance, thoughtfully found</title>
     <script>try{if(!sessionStorage.getItem('ater-home-intro-seen'))document.documentElement.classList.add('home-intro-pending')}catch{document.documentElement.classList.add('home-intro-pending')}</script>
     <link rel="stylesheet" href="assets/css/style.css">
-    <link rel="stylesheet" href="assets/css/storefront.css?v=20261102-responsive">
+    <link rel="stylesheet" href="assets/css/storefront.css?v=20261102-navbar-position">
     <script defer src="assets/js/storefront.js?v=20261102-autosignup"></script>
 </head>
 

@@ -8,7 +8,7 @@ $resetToken = isset($_GET['token']) && is_string($_GET['token']) ? $_GET['token'
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>Choose a new password — Ater</title>
     <link rel="stylesheet" href="assets/css/style.css">
-    <link rel="stylesheet" href="assets/css/storefront.css?v=20261102-responsive">
+    <link rel="stylesheet" href="assets/css/storefront.css?v=20261102-navbar-position">
     <script defer src="assets/js/storefront.js?v=20261102-autosignup"></script>
 </head>
 
