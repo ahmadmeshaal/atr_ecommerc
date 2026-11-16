@@ -1,0 +1,6 @@
+/config/config.php
+/vendor/
+/uploads/products/*
+!/uploads/products/.gitkeep
+/config/mail.php
+/config/google.php
