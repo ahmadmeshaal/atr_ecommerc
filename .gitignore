@@ -4,3 +4,10 @@
 !/uploads/products/.gitkeep
 /config/mail.php
 /config/google.php
+# Local environment and provider credentials
+.env
+.env.*
+!.env.example
+/config/ai.php
+/config/stripe.php
+/config/strip.php
